@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
 import logging
+import os
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -46,25 +48,59 @@ async def _prune_loop(db: Database, retention_days: int) -> None:
         await asyncio.sleep(_PRUNE_INTERVAL_SECONDS)
 
 
+async def health_handler(request: web.Request) -> web.Response:
+    """Minimal health endpoint for Back4App / container platforms."""
+    return web.Response(text="ok", status=200)
+
+
+async def start_health_server() -> web.AppRunner:
+    """Start a tiny HTTP server so the platform health-check succeeds."""
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/healthz", health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info("Health server listening on 0.0.0.0:%s", port)
+    return runner
+
+
 async def main() -> None:
     settings = get_settings()
     db = Database(settings.database_url)
     await db.initialize()
-    bot = Bot(token=settings.bot_token.get_secret_value(), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(
+        token=settings.bot_token.get_secret_value(),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher()
     queue = DownloadQueue(max_waiting=20, per_user_active=1)
 
     async def record_finished_job(job: Job) -> None:
         meta = job.meta or {}
         try:
-            await db.record_download(job.job_id, job.user_id, meta.get("platform", "unknown"),
-                                     job.state.value, meta.get("media_type"))
+            await db.record_download(
+                job.job_id,
+                job.user_id,
+                meta.get("platform", "unknown"),
+                job.state.value,
+                meta.get("media_type"),
+            )
         except Exception:
             logging.exception("failed to record terminal state for job %s", job.job_id)
 
     queue.on_finish = record_finished_job
     await queue.start()
-    prune_task = asyncio.create_task(_prune_loop(db, settings.history_retention_days), name="retention-prune")
+    prune_task = asyncio.create_task(
+        _prune_loop(db, settings.history_retention_days), name="retention-prune"
+    )
+
+    # Start health server (required by Back4App)
+    health_runner = await start_health_server()
 
     dp["download_queue"] = queue
     dp.update.middleware(DatabaseMiddleware(db))
@@ -80,9 +116,11 @@ async def main() -> None:
     dp.include_router(instagram_router)
     dp.include_router(youtube_router)
     dp.include_router(user_router)
+
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        await health_runner.cleanup()
         prune_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await prune_task
